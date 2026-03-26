@@ -1,7 +1,8 @@
 import unittest
 import web_summary
 import json
-import requests
+import os
+import tempfile
 
 class TestSummaryIntegration(unittest.TestCase):
 
@@ -33,40 +34,72 @@ class TestSummaryIntegration(unittest.TestCase):
         self.assertEqual(web_summary.calculate_words_per_block([], 30), 0)
 
     def test_prune_content(self):
-        blocks = ["word " * 20, "word " * 20] # 20 words each
-        # target 10 words total -> 5 per block
+        blocks = ["word " * 20, "word " * 20]
         pruned = web_summary.prune_content(blocks, 10)
         self.assertTrue(len(pruned.split()) <= 10)
-        
-    def test_real_ollama_pipeline(self):
-        """
-        Tests the full pipeline against the real 'example.com' and the local Ollama instance.
-        """
-        url = "https://example.com"
-        # We expect a JSON string back, testing with 50 words summary
-        result_json_str = web_summary.run_pipeline(url, "Summarize this page.", word_count=50)
-        
-        # Verify it parses as JSON
+
+    def test_parse_summary_json(self):
+        result, err = web_summary._parse_summary_json('{"summary": "hello"}', "Test")
+        self.assertEqual(result, {"summary": "hello"})
+        self.assertIsNone(err)
+
+        result, err = web_summary._parse_summary_json("no json here", "Test")
+        self.assertIsNone(result)
+        self.assertIsNotNone(err)
+        self.assertIn("error", err)  # type: ignore[arg-type]
+
+        result, err = web_summary._parse_summary_json("", "Test")
+        self.assertIsNone(result)
+        self.assertIsNotNone(err)
+        self.assertIn("error", err)  # type: ignore[arg-type]
+
+    def test_cache_roundtrip(self):
+        # Use a temp DB so we don't pollute the real cache
+        old_db = web_summary.CACHE_DB
+        fd, tmp = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        web_summary.CACHE_DB = tmp
         try:
+            url, prompt, wc = "https://test.invalid", "test", 50
+            self.assertIsNone(web_summary.cache_get(url, prompt, wc))
+
+            web_summary.cache_put(url, prompt, wc, {"summary": "cached"})
+            self.assertEqual(web_summary.cache_get(url, prompt, wc), {"summary": "cached"})
+
+            # Different params should miss
+            self.assertIsNone(web_summary.cache_get(url, "other", wc))
+        finally:
+            web_summary.CACHE_DB = old_db
+            os.unlink(tmp)
+
+    def test_real_pipeline(self):
+        """Tests the full pipeline against example.com via arbiter or Ollama."""
+        # Use temp cache DB
+        old_db = web_summary.CACHE_DB
+        fd, tmp = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        web_summary.CACHE_DB = tmp
+        try:
+            url = "https://example.com"
+            result_json_str = web_summary.run_pipeline(url, "Summarize this page.", word_count=50)
+
             data = json.loads(result_json_str)
-        except json.JSONDecodeError:
-            self.fail(f"Pipeline returned invalid JSON: {result_json_str}")
-            
-        # Verify structure
-        self.assertIn("summary", data, "JSON result missing 'summary' key")
-        # Properties should NOT be there (or we just ignore it, but user said remove it)
-        # We didn't explicitly forbid it in schema, just didn't ask for it.
-        # But let's check content exists
-        
-        summary_text = data["summary"]
-        self.assertTrue(len(summary_text) > 0, "Summary text was empty")
-        print(f"\n[Real Ollama Response] Summary: {summary_text}")
-        
-        # Basic check if word count is somewhat respected (it's approximate for LLMs)
-        word_count = len(summary_text.split())
-        print(f"Word count: {word_count}")
-        # We asked for 50, so it shouldn't be huge.
-        self.assertTrue(word_count < 100, f"Summary too long: {word_count} words")
+            self.assertIn("summary", data, f"JSON result missing 'summary' key: {data}")
+
+            summary_text = data["summary"]
+            self.assertTrue(len(summary_text) > 0, "Summary text was empty")
+            print(f"\n[LLM Response] Summary: {summary_text}")
+
+            word_count = len(summary_text.split())
+            print(f"Word count: {word_count}")
+            self.assertTrue(word_count < 100, f"Summary too long: {word_count} words")
+
+            # Second call should hit cache
+            result2 = web_summary.run_pipeline(url, "Summarize this page.", word_count=50)
+            self.assertEqual(result_json_str, result2)
+        finally:
+            web_summary.CACHE_DB = old_db
+            os.unlink(tmp)
 
 if __name__ == '__main__':
     unittest.main()
